@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+#    Copyright (C) 2011  Rubén Rodríguez <ruben@trisquel.info>
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+#
+
+VERSION=1
+COMPONENT=main
+
+. ./config
+
+cat << EOF | patch -p1
+From 87f61439784427a436b8fb2739c8c24699163e96 Mon Sep 17 00:00:00 2001
+From: Carlos Garnacho <carlos@lanedo.com>
+Date: Wed, 27 Jun 2012 14:51:57 +0200
+Subject: [PATCH] introspection: mark data in GtkCallback as closure
+
+This is needed for so GtkContainer::forall() can be implemented
+in non-native code, and the callback gets the passed data if
+called.
+
+https://bugzilla.gnome.org/show_bug.cgi?id=644926
+---
+ gtk/gtkwidget.h |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/gtk/gtkwidget.h b/gtk/gtkwidget.h
+index 33a54d0..d9ff046 100644
+--- a/gtk/gtkwidget.h
++++ b/gtk/gtkwidget.h
+@@ -78,7 +78,7 @@ typedef 	GdkRectangle	   GtkAllocation;
+ /**
+  * GtkCallback:
+  * @widget: the widget to operate on
+- * @data: user-supplied data
++ * @data: (closure): user-supplied data
+  *
+  * The type of the callback functions used for e.g. iterating over
+  * the children of a container, see gtk_container_foreach().
+-- 
+1.7.10.2
+EOF
+
+changelog "Disabled resize grips by default"
+
+PARALLEL=false compile
+

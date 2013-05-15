@@ -1,0 +1,35 @@
+From 0912441778e91dbbd8677b434efbdf0b7df4d2b2 Mon Sep 17 00:00:00 2001
+From: Simon Feltman <s.feltman@gmail.com>
+Date: Sun, 29 Jul 2012 23:36:25 -0700
+Subject: [PATCH] Fix crash when returning (False, None) from
+ Gtk.TreeModel.do_get_iter.
+
+Added a Py_None check before attempting memcpy.
+
+https://bugzilla.gnome.org/show_bug.cgi?id=680812
+---
+ gi/pygi-closure.c |    8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/gi/pygi-closure.c b/gi/pygi-closure.c
+index 8c8e13d..1982c1b 100644
+--- a/gi/pygi-closure.c
++++ b/gi/pygi-closure.c
+@@ -82,8 +82,12 @@ _pygi_closure_assign_pyobj_to_out_argument (gpointer out_arg, PyObject *object,
+ 
+            if (!g_type_info_is_pointer (type_info) &&
+ 	       interface_type == GI_INFO_TYPE_STRUCT) {
+-               gsize item_size = _pygi_g_type_info_size (type_info);
+-               memcpy (out_arg, arg.v_pointer, item_size);
++               if (object == Py_None) {
++        	   arg.v_pointer = NULL;
++               } else {
++        	   gsize item_size = _pygi_g_type_info_size (type_info);
++        	   memcpy (out_arg, arg.v_pointer, item_size);
++               }
+                break;
+            }
+         }
+-- 
+1.7.9.5
+

@@ -1,0 +1,672 @@
+From f3b25d40c48196077f9ac60a248c46bb78418b93 Mon Sep 17 00:00:00 2001
+From: "John (J5) Palmieri" <johnp@redhat.com>
+Date: Tue, 21 Feb 2012 15:13:42 +0100
+Subject: [PATCH] Add a ccallback type which is used to invoke callbacks
+ passed to a vfunc
+
+Used when overriding methods like gtk_container_forall wich pass in a
+callback that needs to be executed on internal children:
+    def do_forall(self, callback, userdata):
+        callback(self.custom_child, userdata)
+
+https://bugzilla.gnome.org/show_bug.cgi?id=644926
+
+Co-authored-by: Tomeu Vizoso <tomeu.vizoso@collabora.co.uk>
+Co-authored-by: Simon Schampijer <simon@laptop.org>
+---
+ gi/Makefile.am                |    2 +
+ gi/gimodule.c                 |    1 +
+ gi/module.py                  |    5 ++
+ gi/pygi-argument.c            |   12 +-----
+ gi/pygi-cache.c               |   28 ++++++++++--
+ gi/pygi-cache.h               |    9 +++-
+ gi/pygi-ccallback.c           |  100 +++++++++++++++++++++++++++++++++++++++++
+ gi/pygi-ccallback.h           |   41 +++++++++++++++++
+ gi/pygi-closure.c             |   50 ++++++++++++++++++++-
+ gi/pygi-invoke-state-struct.h |    2 +
+ gi/pygi-invoke.c              |   73 +++++++++++++++++++++---------
+ gi/pygi-invoke.h              |    3 +
+ gi/pygi-private.h             |    1 +
+ gi/pygi.h                     |   10 ++++
+ tests/test_gi.py              |   14 ++++++
+ 15 files changed, 310 insertions(+), 41 deletions(-)
+ create mode 100644 gi/pygi-ccallback.c
+ create mode 100644 gi/pygi-ccallback.h
+
+diff --git a/gi/Makefile.am b/gi/Makefile.am
+index 2009d2c..53d7564 100644
+--- a/gi/Makefile.am
++++ b/gi/Makefile.am
+@@ -54,6 +54,8 @@ _gi_la_SOURCES = \
+ 	pygi-boxed.h \
+ 	pygi-closure.c \
+ 	pygi-closure.h \
++	pygi-ccallback.c \
++	pygi-ccallback.h \
+ 	pygi-callbacks.c \
+ 	pygi-callbacks.h \
+ 	pygi.h \
+diff --git a/gi/gimodule.c b/gi/gimodule.c
+index 1961c17..6ccd87f 100644
+--- a/gi/gimodule.c
++++ b/gi/gimodule.c
+@@ -492,6 +492,7 @@ PYGLIB_MODULE_START(_gi, "_gi")
+     _pygi_info_register_types (module);
+     _pygi_struct_register_types (module);
+     _pygi_boxed_register_types (module);
++    _pygi_ccallback_register_types (module);
+     _pygi_argument_init();
+ 
+     api = PYGLIB_CPointer_WrapPointer ( (void *) &CAPI, "gi._API");
+diff --git a/gi/module.py b/gi/module.py
+index b749491..083354d 100644
+--- a/gi/module.py
++++ b/gi/module.py
+@@ -43,8 +43,10 @@ from ._gi import \
+     ConstantInfo, \
+     StructInfo, \
+     UnionInfo, \
++    CallbackInfo, \
+     Struct, \
+     Boxed, \
++    CCallback, \
+     enum_add, \
+     enum_register_new_gtype_and_add, \
+     flags_add, \
+@@ -155,6 +157,9 @@ class IntrospectionModule(object):
+                         if not issubclass(parent, interface))
+                 bases = (parent,) + interfaces
+                 metaclass = GObjectMeta
++            elif isinstance(info, CallbackInfo):
++                bases = (CCallback,)
++                metaclass = GObjectMeta
+             elif isinstance(info, InterfaceInfo):
+                 bases = (_gobject.GInterface,)
+                 metaclass = GObjectMeta
+diff --git a/gi/pygi-argument.c b/gi/pygi-argument.c
+index 894f60b..64602f2 100644
+--- a/gi/pygi-argument.c
++++ b/gi/pygi-argument.c
+@@ -1547,17 +1547,7 @@ _pygi_argument_to_object (GIArgument  *arg,
+             switch (info_type) {
+                 case GI_INFO_TYPE_CALLBACK:
+                 {
+-                    /* There is no way we can support a callback return
+-                     * as we are never sure if the callback was set from C
+-                     * or Python.  API that return callbacks are broken
+-                     * so we print a warning and send back a None
+-                     */
+-
+-                    g_warning ("You are trying to use an API which returns a callback."
+-                               "Callback returns can not be supported. Returning None instead.");
+-                    object = Py_None;
+-                    Py_INCREF (object);
+-                    break;
++                    g_assert_not_reached();
+                 }
+                 case GI_INFO_TYPE_BOXED:
+                 case GI_INFO_TYPE_STRUCT:
+diff --git a/gi/pygi-cache.c b/gi/pygi-cache.c
+index 5b107e1..5a653c2 100644
+--- a/gi/pygi-cache.c
++++ b/gi/pygi-cache.c
+@@ -1233,6 +1233,7 @@ _arg_name_list_generate (PyGICallableCache *callable_cache)
+         arg_cache = callable_cache->args_cache[i];
+ 
+         if (arg_cache->meta_type != PYGI_META_ARG_TYPE_CHILD &&
++            arg_cache->meta_type != PYGI_META_ARG_TYPE_CLOSURE &&
+                 (arg_cache->direction == PYGI_DIRECTION_FROM_PYTHON ||
+                  arg_cache->direction == PYGI_DIRECTION_BIDIRECTIONAL)) {
+ 
+@@ -1331,8 +1332,24 @@ _args_cache_generate (GICallableInfo *callable_info,
+         gboolean is_caller_allocates = FALSE;
+         gssize py_arg_index = -1;
+ 
+-        arg_info =
+-            g_callable_info_get_arg (callable_info, i);
++        arg_info = g_callable_info_get_arg (callable_info, i);
++
++        if (g_arg_info_get_closure (arg_info) == i) {
++
++            arg_cache = _arg_cache_alloc ();
++            callable_cache->args_cache[arg_index] = arg_cache;
++
++            arg_cache->arg_name = g_base_info_get_name ((GIBaseInfo *) arg_info);
++            arg_cache->direction = PYGI_DIRECTION_FROM_PYTHON;
++            arg_cache->meta_type = PYGI_META_ARG_TYPE_CLOSURE;
++            arg_cache->c_arg_index = i;
++
++            callable_cache->n_from_py_args++;
++
++            g_base_info_unref ( (GIBaseInfo *)arg_info);
++
++            continue;
++        }
+ 
+         /* For vfuncs and callbacks our marshalling directions
+            are reversed */
+@@ -1430,7 +1447,7 @@ arg_err:
+ }
+ 
+ PyGICallableCache *
+-_pygi_callable_cache_new (GICallableInfo *callable_info)
++_pygi_callable_cache_new (GICallableInfo *callable_info, gboolean is_ccallback)
+ {
+     PyGICallableCache *cache;
+     GIInfoType type = g_base_info_get_type ( (GIBaseInfo *)callable_info);
+@@ -1454,7 +1471,10 @@ _pygi_callable_cache_new (GICallableInfo *callable_info)
+     } else if (type == GI_INFO_TYPE_VFUNC) {
+         cache->function_type = PYGI_FUNCTION_TYPE_VFUNC;
+     } else if (type == GI_INFO_TYPE_CALLBACK) {
+-        cache->function_type = PYGI_FUNCTION_TYPE_CALLBACK;
++        if (is_ccallback)
++            cache->function_type = PYGI_FUNCTION_TYPE_CCALLBACK;
++        else
++            cache->function_type = PYGI_FUNCTION_TYPE_CALLBACK;
+     } else {
+         cache->function_type = PYGI_FUNCTION_TYPE_METHOD;
+     }
+diff --git a/gi/pygi-cache.h b/gi/pygi-cache.h
+index 510987b..6e5e0ab 100644
+--- a/gi/pygi-cache.h
++++ b/gi/pygi-cache.h
+@@ -68,7 +68,8 @@ typedef enum {
+     PYGI_META_ARG_TYPE_PARENT,
+     PYGI_META_ARG_TYPE_CHILD,
+     PYGI_META_ARG_TYPE_CHILD_NEEDS_UPDATE,
+-    PYGI_META_ARG_TYPE_CHILD_WITH_PYARG
++    PYGI_META_ARG_TYPE_CHILD_WITH_PYARG,
++    PYGI_META_ARG_TYPE_CLOSURE,
+ } PyGIMetaArgType;
+ 
+ /*
+@@ -82,7 +83,8 @@ typedef enum {
+     PYGI_FUNCTION_TYPE_METHOD,
+     PYGI_FUNCTION_TYPE_CONSTRUCTOR,
+     PYGI_FUNCTION_TYPE_VFUNC,
+-    PYGI_FUNCTION_TYPE_CALLBACK
++    PYGI_FUNCTION_TYPE_CALLBACK,
++    PYGI_FUNCTION_TYPE_CCALLBACK,
+  } PyGIFunctionType;
+ 
+ /*
+@@ -187,7 +189,8 @@ struct _PyGICallableCache
+ void _pygi_arg_cache_clear	(PyGIArgCache *cache);
+ void _pygi_callable_cache_free	(PyGICallableCache *cache);
+ 
+-PyGICallableCache *_pygi_callable_cache_new (GICallableInfo *callable_info);
++PyGICallableCache *_pygi_callable_cache_new (GICallableInfo *callable_info,
++                                             gboolean is_ccallback);
+ 
+ G_END_DECLS
+ 
+diff --git a/gi/pygi-ccallback.c b/gi/pygi-ccallback.c
+new file mode 100644
+index 0000000..bf3ec8a
+--- /dev/null
++++ b/gi/pygi-ccallback.c
+@@ -0,0 +1,100 @@
++/* -*- Mode: C; c-basic-offset: 4 -*-
++ * vim: tabstop=4 shiftwidth=4 expandtab
++ *
++ * Copyright (C) 2011 John (J5) Palmieri <johnp@redhat.com>, Red Hat, Inc.
++ *
++ *   pygi-boxed-closure.c: wrapper to handle GClosure box types with C callbacks.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301
++ * USA
++ */
++
++#include "pygi-private.h"
++
++#include <pygobject.h>
++#include <girepository.h>
++#include <pyglib-python-compat.h>
++
++
++static PyObject *
++_ccallback_call(PyGICCallback *self, PyObject *args, PyObject *kwargs)
++{
++    PyObject *result;
++    GCallback *func;
++
++    if (self->cache == NULL) {
++        self->cache = _pygi_callable_cache_new (self->info, TRUE);
++        if (self->cache == NULL)
++            return NULL;
++    }
++
++    result = pygi_callable_info_invoke( (GIBaseInfo *) self->info,
++                                         args,
++                                         kwargs,
++                                         self->cache,
++                                         self->callback,
++                                         self->user_data);
++    return result;
++}
++
++PYGLIB_DEFINE_TYPE("gi.CCallback", PyGICCallback_Type, PyGICCallback);
++
++PyObject *
++_pygi_ccallback_new (GCallback callback,
++                     gpointer user_data,
++                     GIScopeType scope,
++                     GIFunctionInfo *info,
++                     GDestroyNotify destroy_notify)
++{
++    PyGICCallback *self;
++
++    if (!callback) {
++        Py_RETURN_NONE;
++    }
++
++    self = (PyGICCallback *) PyGICCallback_Type.tp_alloc (&PyGICCallback_Type, 0);
++    if (self == NULL) {
++        return NULL;
++    }
++
++    self->callback = (GCallback) callback;
++    self->user_data = user_data;
++    self->scope = scope;
++    self->destroy_notify_func = destroy_notify;
++    self->info = g_base_info_ref( (GIBaseInfo *) info);
++
++    return (PyObject *) self;
++}
++
++static void
++_ccallback_dealloc (PyGICCallback *self)
++{
++    g_base_info_unref ( (GIBaseInfo *)self->info);
++}
++
++void
++_pygi_ccallback_register_types (PyObject *m)
++{
++    Py_TYPE(&PyGICCallback_Type) = &PyType_Type;
++    PyGICCallback_Type.tp_flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE);
++    PyGICCallback_Type.tp_dealloc = (destructor) _ccallback_dealloc;
++    PyGICCallback_Type.tp_call = (ternaryfunc) _ccallback_call;
++
++
++    if (PyType_Ready (&PyGICCallback_Type))
++        return;
++    if (PyModule_AddObject (m, "CCallback", (PyObject *) &PyGICCallback_Type))
++        return;
++}
+diff --git a/gi/pygi-ccallback.h b/gi/pygi-ccallback.h
+new file mode 100644
+index 0000000..c796092
+--- /dev/null
++++ b/gi/pygi-ccallback.h
+@@ -0,0 +1,41 @@
++/* -*- Mode: C; c-basic-offset: 4 -*-
++ * vim: tabstop=4 shiftwidth=4 expandtab
++ *
++ * Copyright (C) 2011 John (J5) Palmieri <johnp@redhat.com>, Red Hat, Inc.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301
++ * USA
++ */
++
++#ifndef __PYGI_CCLOSURE_H__
++#define __PYGI_CCLOSURE_H__
++
++#include <Python.h>
++
++G_BEGIN_DECLS
++
++extern PyTypeObject PyGICCallback_Type;
++
++PyObject * _pygi_ccallback_new (GCallback       callback,
++                                gpointer        user_data,
++                                GIScopeType     scope,
++                                GIFunctionInfo *info,
++                                GDestroyNotify  destroy_notify);
++
++void _pygi_ccallback_register_types (PyObject *m);
++
++G_END_DECLS
++
++#endif /* __PYGI_CCLOSURE_H__ */
+diff --git a/gi/pygi-closure.c b/gi/pygi-closure.c
+index 6fc08fb..c89be64 100644
+--- a/gi/pygi-closure.c
++++ b/gi/pygi-closure.c
+@@ -155,7 +155,8 @@ _pygi_closure_convert_ffi_arguments (GICallableInfo *callable_info, void **args)
+                         g_args[i].v_double = * (double *) args[i];
+                         g_base_info_unref (interface);
+                         break;
+-                    } else if (interface_type == GI_INFO_TYPE_STRUCT) {
++                    } else if (interface_type == GI_INFO_TYPE_STRUCT ||
++                               interface_type == GI_INFO_TYPE_CALLBACK) {
+                         g_args[i].v_pointer = * (gpointer *) args[i];
+                         g_base_info_unref (interface);
+                         break;
+@@ -167,6 +168,7 @@ _pygi_closure_convert_ffi_arguments (GICallableInfo *callable_info, void **args)
+                 case GI_TYPE_TAG_GHASH:
+                 case GI_TYPE_TAG_GLIST:
+                 case GI_TYPE_TAG_GSLIST:
++                case GI_TYPE_TAG_VOID:
+                     g_args[i].v_pointer = * (gpointer *) args[i];
+                     break;
+                 default:
+@@ -188,6 +190,9 @@ _pygi_closure_convert_arguments (GICallableInfo *callable_info, void **args,
+     int n_in_args = 0;
+     int n_out_args = 0;
+     int i;
++    int user_data_arg = -1;
++    int destroy_notify_arg = -1;
++
+     GIArgument *g_args = NULL;
+ 
+     *py_args = NULL;
+@@ -200,6 +205,10 @@ _pygi_closure_convert_arguments (GICallableInfo *callable_info, void **args,
+     g_args = _pygi_closure_convert_ffi_arguments (callable_info, args);
+ 
+     for (i = 0; i < n_args; i++) {
++        /* Special case callbacks and skip over userdata and Destroy Notify */
++        if (i == user_data_arg || i == destroy_notify_arg)
++            continue;
++
+         GIArgInfo *arg_info = g_callable_info_get_arg (callable_info, i);
+         GIDirection direction = g_arg_info_get_direction (arg_info);
+ 
+@@ -220,6 +229,45 @@ _pygi_closure_convert_arguments (GICallableInfo *callable_info, void **args,
+                     value = user_data;
+                     Py_INCREF (value);
+                 }
++            } else if (direction == GI_DIRECTION_IN &&
++                       arg_tag == GI_TYPE_TAG_INTERFACE) {
++                /* Handle callbacks as a special case */
++                GIBaseInfo *info;
++                GIInfoType info_type;
++
++                info = g_type_info_get_interface (arg_type);
++                info_type = g_base_info_get_type (info);
++
++                arg = (GIArgument*) &g_args[i];
++
++                if (info_type == GI_INFO_TYPE_CALLBACK) {
++                    gpointer user_data = NULL;
++                    GDestroyNotify destroy_notify = NULL;
++                    GIScopeType scope = g_arg_info_get_scope(arg_info);
++
++                    user_data_arg = g_arg_info_get_closure(arg_info);
++                    destroy_notify_arg = g_arg_info_get_destroy(arg_info);
++
++                    if (user_data_arg != -1)
++                        user_data = g_args[user_data_arg].v_pointer;
++
++                    if (destroy_notify_arg != -1)
++                        user_data = (GDestroyNotify) g_args[destroy_notify_arg].v_pointer;
++
++                    value = _pygi_ccallback_new(arg->v_pointer,
++                                                user_data,
++                                                scope,
++                                                (GIFunctionInfo *) info,
++                                                destroy_notify);
++                } else
++                    value = _pygi_argument_to_object (arg, arg_type, transfer);
++
++                g_base_info_unref (info);
++                if (value == NULL) {
++                    g_base_info_unref (arg_type);
++                    g_base_info_unref (arg_info);
++                    goto error;
++                }
+             } else {
+                 if (direction == GI_DIRECTION_IN)
+                     arg = (GIArgument*) &g_args[i];
+diff --git a/gi/pygi-invoke-state-struct.h b/gi/pygi-invoke-state-struct.h
+index a4072b7..f5a3d3e 100644
+--- a/gi/pygi-invoke-state-struct.h
++++ b/gi/pygi-invoke-state-struct.h
+@@ -37,6 +37,8 @@ typedef struct _PyGIInvokeState
+     GError *error;
+ 
+     gboolean failed;
++
++    gpointer user_data;
+ } PyGIInvokeState;
+ 
+ G_END_DECLS
+diff --git a/gi/pygi-invoke.c b/gi/pygi-invoke.c
+index 42cdd01..cabdab9 100644
+--- a/gi/pygi-invoke.c
++++ b/gi/pygi-invoke.c
+@@ -29,7 +29,8 @@
+ static inline gboolean
+ _invoke_callable (PyGIInvokeState *state,
+                   PyGICallableCache *cache,
+-                  GICallableInfo *callable_info)
++                  GICallableInfo *callable_info,
++                  GCallback function_ptr)
+ {
+     GError *error;
+     gint retval;
+@@ -48,6 +49,17 @@ _invoke_callable (PyGIInvokeState *state,
+                                        cache->n_to_py_args,
+                                       &state->return_arg,
+                                       &error);
++    else if (g_base_info_get_type (callable_info) == GI_INFO_TYPE_CALLBACK)
++        retval = g_callable_info_invoke (callable_info,
++                                         function_ptr,
++                                         state->in_args,
++                                         cache->n_from_py_args,
++                                         state->out_args,
++                                         cache->n_to_py_args,
++                                         &state->return_arg,
++                                         FALSE,
++                                         FALSE,
++                                         &error);
+     else
+         retval = g_function_info_invoke ( callable_info,
+                                           state->in_args,
+@@ -149,10 +161,12 @@ _py_args_combine_and_check_length (const gchar *function_name,
+     GSList *l;
+ 
+     n_py_args = PyTuple_GET_SIZE (py_args);
+-    n_py_kwargs = PyDict_Size (py_kwargs);
++    if (py_kwargs == NULL)
++        n_py_kwargs = 0;
++    else
++        n_py_kwargs = PyDict_Size (py_kwargs);
+ 
+     n_expected_args = g_slist_length (arg_name_list);
+-
+     if (n_py_kwargs == 0 && n_py_args == n_expected_args) {
+         return py_args;
+     }
+@@ -170,7 +184,9 @@ _py_args_combine_and_check_length (const gchar *function_name,
+         return NULL;
+     }
+ 
+-    if (!_check_for_unexpected_kwargs (function_name, arg_name_hash, py_kwargs)) {
++    if (n_py_kwargs > 0 && !_check_for_unexpected_kwargs (function_name,
++                                                          arg_name_hash,
++                                                          py_kwargs)) {
+         Py_DECREF (py_args);
+         return NULL;
+     }
+@@ -191,7 +207,7 @@ _py_args_combine_and_check_length (const gchar *function_name,
+         PyObject *py_arg_item, *kw_arg_item = NULL;
+         const gchar *arg_name = l->data;
+ 
+-        if (arg_name != NULL) {
++        if (n_py_kwargs > 0 && arg_name != NULL) {
+             /* NULL means this argument has no keyword name */
+             /* ex. the first argument to a method or constructor */
+             kw_arg_item = PyDict_GetItemString (py_kwargs, arg_name);
+@@ -400,7 +416,10 @@ _invoke_marshal_in_args (PyGIInvokeState *state, PyGICallableCache *cache)
+                 state->args[i] = &(state->in_args[in_count]);
+                 in_count++;
+ 
+-                if (arg_cache->meta_type > 0)
++                if (arg_cache->meta_type == PYGI_META_ARG_TYPE_CLOSURE) {
++                    state->args[i]->v_pointer = state->user_data;
++                    continue;
++                } else if (arg_cache->meta_type != PYGI_META_ARG_TYPE_PARENT)
+                     continue;
+ 
+                 if (arg_cache->py_arg_index >= state->n_py_in_args) {
+@@ -611,34 +630,44 @@ _invoke_marshal_out_args (PyGIInvokeState *state, PyGICallableCache *cache)
+ }
+ 
+ PyObject *
+-_wrap_g_callable_info_invoke (PyGIBaseInfo *self,
+-                              PyObject *py_args,
+-                              PyObject *kwargs)
++pygi_callable_info_invoke (GIBaseInfo *info, PyObject *py_args,
++                           PyObject *kwargs, PyGICallableCache *cache,
++                           GCallback function_ptr, gpointer user_data)
+ {
+     PyGIInvokeState state = { 0, };
+     PyObject *ret = NULL;
+ 
+-    if (self->cache == NULL) {
+-        self->cache = _pygi_callable_cache_new (self->info);
+-        if (self->cache == NULL)
+-            return NULL;
+-    }
+-
+-    if (!_invoke_state_init_from_callable_cache (&state, self->cache, py_args, kwargs))
++    if (!_invoke_state_init_from_callable_cache (&state, cache, py_args, kwargs))
+         goto err;
+ 
+-    if (!_invoke_marshal_in_args (&state, self->cache))
++    if (cache->function_type == PYGI_FUNCTION_TYPE_CCALLBACK)
++        state.user_data = user_data;
++
++    if (!_invoke_marshal_in_args (&state, cache))
+         goto err;
+ 
+-    if (!_invoke_callable (&state, self->cache, self->info))
++    if (!_invoke_callable (&state, cache, info, function_ptr))
+         goto err;
+ 
+-    pygi_marshal_cleanup_args_from_py_marshal_success (&state, self->cache);
++    pygi_marshal_cleanup_args_from_py_marshal_success (&state, cache);
+ 
+-    ret = _invoke_marshal_out_args (&state, self->cache);
++    ret = _invoke_marshal_out_args (&state, cache);
+     if (ret)
+-        pygi_marshal_cleanup_args_to_py_marshal_success (&state, self->cache);
++        pygi_marshal_cleanup_args_to_py_marshal_success (&state, cache);
+ err:
+-    _invoke_state_clear (&state, self->cache);
++    _invoke_state_clear (&state, cache);
+     return ret;
+ }
++
++PyObject *
++_wrap_g_callable_info_invoke (PyGIBaseInfo *self, PyObject *py_args,
++                              PyObject *kwargs)
++{
++    if (self->cache == NULL) {
++        self->cache = _pygi_callable_cache_new (self->info, FALSE);
++        if (self->cache == NULL)
++            return NULL;
++    }
++
++    return pygi_callable_info_invoke (self->info, py_args, kwargs, self->cache, NULL, NULL);
++}
+diff --git a/gi/pygi-invoke.h b/gi/pygi-invoke.h
+index 0aa7580..051bc8d 100644
+--- a/gi/pygi-invoke.h
++++ b/gi/pygi-invoke.h
+@@ -30,6 +30,9 @@
+ #include "pygi-invoke-state-struct.h"
+ G_BEGIN_DECLS
+ 
++PyObject *pygi_callable_info_invoke (GIBaseInfo *info, PyObject *py_args,
++                                     PyObject *kwargs, PyGICallableCache *cache,
++                                     GCallback function_ptr, gpointer user_data);
+ PyObject *_wrap_g_callable_info_invoke (PyGIBaseInfo *self, PyObject *py_args,
+                                         PyObject *kwargs);
+ 
+diff --git a/gi/pygi-private.h b/gi/pygi-private.h
+index 28e7997..29ec131 100644
+--- a/gi/pygi-private.h
++++ b/gi/pygi-private.h
+@@ -26,6 +26,7 @@
+ #include "pygi-type.h"
+ #include "pygi-foreign.h"
+ #include "pygi-closure.h"
++#include "pygi-ccallback.h"
+ #include "pygi-callbacks.h"
+ #include "pygi-property.h"
+ #include "pygi-signal-closure.h"
+diff --git a/gi/pygi.h b/gi/pygi.h
+index ef65241..121eae5 100644
+--- a/gi/pygi.h
++++ b/gi/pygi.h
+@@ -55,6 +55,16 @@ typedef struct {
+     gsize size;
+ } PyGIBoxed;
+ 
++typedef struct {
++    PyObject_HEAD
++    GCallback callback;
++    GIFunctionInfo *info;
++    gpointer user_data;
++    GIScopeType scope;
++    GDestroyNotify destroy_notify_func;
++    PyGICallableCache *cache;
++} PyGICCallback;
++
+ typedef PyObject * (*PyGIArgOverrideToGIArgumentFunc) (PyObject        *value,
+                                                        GIInterfaceInfo *interface_info,
+                                                        GITransfer       transfer,
+diff --git a/tests/test_gi.py b/tests/test_gi.py
+index edbe461..f7a3175 100644
+--- a/tests/test_gi.py
++++ b/tests/test_gi.py
+@@ -1696,6 +1696,20 @@ class TestPythonGObject(unittest.TestCase):
+         GIMarshallingTests.SubSubObject.do_method_deep_hierarchy(sub_sub_sub_object, 5)
+         self.assertEqual(sub_sub_sub_object.props.int, 5)
+ 
++    def test_callback_in_vfunc(self):
++        class SubObject(GIMarshallingTests.Object):
++            def __init__(self):
++                GObject.GObject.__init__(self)
++                self.worked = False
++
++            def do_vfunc_with_callback(self, callback):
++                self.worked = callback(42) == 42
++
++        _object = SubObject()
++        _object.call_vfunc_with_callback()
++        self.assertTrue(_object.worked == True)
++        _object.call_vfunc_with_callback()
++        self.assertTrue(_object.worked == True)
+ 
+ class TestMultiOutputArgs(unittest.TestCase):
+ 
+-- 
+1.7.7.6
+

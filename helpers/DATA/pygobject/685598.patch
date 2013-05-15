@@ -1,0 +1,513 @@
+From b5c683ed27c7236bd8b1c0c6a42dd19ddbf119db Mon Sep 17 00:00:00 2001
+From: Simon Feltman <s.feltman@gmail.com>
+Date: Mon, 8 Oct 2012 05:54:30 -0700
+Subject: [PATCH] Fix leak with python callables as closure argument.
+
+The fix adds an extra args_data list to the PyGIInvokeState
+structure. This list is used to track dynamically generated
+closures that wrap python callables. This allows the ffi closure
+and python callable to be freed when call scope has finished.
+
+https://bugzilla.gnome.org/show_bug.cgi?id=685598
+---
+ gi/pygi-cache.c               |    1 +
+ gi/pygi-closure.c             |   41 ++++++++----
+ gi/pygi-invoke-state-struct.h |    4 ++
+ gi/pygi-invoke.c              |    7 +++
+ gi/pygi-marshal-cleanup.c     |   14 +++++
+ gi/pygi-marshal-cleanup.h     |    4 ++
+ gi/pygi-marshal-from-py.c     |   57 +++++++++++++----
+ tests/test_everything.py      |  137 ++++++++++++++++++++++++++++++-----------
+ 8 files changed, 206 insertions(+), 59 deletions(-)
+
+diff --git a/gi/pygi-cache.c b/gi/pygi-cache.c
+index d6531ed..21dd58f 100644
+--- a/gi/pygi-cache.c
++++ b/gi/pygi-cache.c
+@@ -678,6 +678,7 @@ _arg_cache_from_py_interface_callback_setup (PyGIArgCache *arg_cache,
+         callable_cache->args_cache[callback_cache->destroy_notify_index] = destroy_arg_cache;
+     }
+     arg_cache->from_py_marshaller = _pygi_marshal_from_py_interface_callback;
++    arg_cache->from_py_cleanup = _pygi_marshal_cleanup_from_py_interface_callback;
+ }
+ 
+ static void
+diff --git a/gi/pygi-closure.c b/gi/pygi-closure.c
+index f6f5c51..8ba8020 100644
+--- a/gi/pygi-closure.c
++++ b/gi/pygi-closure.c
+@@ -455,6 +455,24 @@ _pygi_closure_set_out_arguments (GICallableInfo *callable_info,
+     }
+ }
+ 
++static void
++_pygi_invoke_closure_clear_py_data(PyGICClosure *invoke_closure)
++{
++    PyGILState_STATE state = PyGILState_Ensure();
++
++    if (invoke_closure->function != NULL) {
++        Py_DECREF (invoke_closure->function);
++        invoke_closure->function = NULL;
++    }
++
++    if (invoke_closure->user_data != NULL) {
++        Py_DECREF (invoke_closure->user_data);
++        invoke_closure->user_data = NULL;
++    }
++
++    PyGILState_Release (state);
++}
++
+ void
+ _pygi_closure_handle (ffi_cif *cif,
+                       void    *result,
+@@ -495,10 +513,12 @@ end:
+     PyGILState_Release (state);
+ 
+     /* Now that the closure has finished we can make a decision about how
+-       to free it.  Scope call gets free'd at the end of wrap_g_function_info_invoke
+-       scope notified will be freed,  when the notify is called and we can free async
+-       anytime we want as long as its after we return from this function (you can't free the closure
+-       you are currently using!)
++       to free it.  Scope call gets free'd at the end of wrap_g_function_info_invoke.
++       Scope notified will be freed when the notify is called.
++       Scope async closures free only their python data now and the closure later
++       during the next creation of a closure. This minimizes potential ref leaks
++       at least in regards to the python objects.
++       (you can't free the closure you are currently using!)
+     */
+     switch (closure->scope) {
+         case GI_SCOPE_TYPE_CALL:
+@@ -507,6 +527,7 @@ end:
+         case GI_SCOPE_TYPE_ASYNC:
+             /* Append this PyGICClosure to a list of closure that we will free
+                after we're done with this function invokation */
++            _pygi_invoke_closure_clear_py_data(closure);
+             async_free_list = g_slist_prepend (async_free_list, closure);
+             break;
+         default:
+@@ -517,20 +538,15 @@ end:
+ 
+ void _pygi_invoke_closure_free (gpointer data)
+ {
+-    PyGILState_STATE state;
+     PyGICClosure* invoke_closure = (PyGICClosure *) data;
+ 
+-    state = PyGILState_Ensure();
+-    Py_DECREF (invoke_closure->function);
+-
+     g_callable_info_free_closure (invoke_closure->info,
+                                   invoke_closure->closure);
+ 
+     if (invoke_closure->info)
+         g_base_info_unref ( (GIBaseInfo*) invoke_closure->info);
+ 
+-    Py_XDECREF (invoke_closure->user_data);
+-    PyGILState_Release (state);
++    _pygi_invoke_closure_clear_py_data(invoke_closure);
+ 
+     g_slice_free (PyGICClosure, invoke_closure);
+ }
+@@ -553,11 +569,10 @@ _pygi_make_native_closure (GICallableInfo* info,
+     closure = g_slice_new0 (PyGICClosure);
+     closure->info = (GICallableInfo *) g_base_info_ref ( (GIBaseInfo *) info);
+     closure->function = py_function;
+-    closure->user_data = py_user_data;
++    closure->user_data = py_user_data ? py_user_data : Py_None;
+ 
+     Py_INCREF (py_function);
+-    if (closure->user_data)
+-        Py_INCREF (closure->user_data);
++    Py_INCREF (closure->user_data);
+ 
+     fficlosure =
+         g_callable_info_prepare_closure (info, &closure->cif, _pygi_closure_handle,
+diff --git a/gi/pygi-invoke-state-struct.h b/gi/pygi-invoke-state-struct.h
+index f5a3d3e..1d9e49c 100644
+--- a/gi/pygi-invoke-state-struct.h
++++ b/gi/pygi-invoke-state-struct.h
+@@ -18,6 +18,10 @@ typedef struct _PyGIInvokeState
+     GIArgument **args;
+     GIArgument *in_args;
+ 
++    /* Generic array allocated to the same length as args
++     * for use as extra per-arg state data. */
++    gpointer *args_data;
++
+     /* Out args and out values
+      * In order to pass a parameter and get something back out in C
+      * we need to pass a pointer to the value, e.g.
+diff --git a/gi/pygi-invoke.c b/gi/pygi-invoke.c
+index cabdab9..c0f7179 100644
+--- a/gi/pygi-invoke.c
++++ b/gi/pygi-invoke.c
+@@ -315,6 +315,12 @@ _invoke_state_init_from_callable_cache (PyGIInvokeState *state,
+         return FALSE;
+     }
+ 
++    state->args_data = g_slice_alloc0 (cache->n_args * sizeof (gpointer));
++    if (state->args_data == NULL && cache->n_args != 0) {
++        PyErr_NoMemory();
++        return FALSE;
++    }
++
+     state->in_args = g_slice_alloc0 (cache->n_from_py_args * sizeof(GIArgument));
+     if (state->in_args == NULL && cache->n_from_py_args != 0) {
+         PyErr_NoMemory ();
+@@ -342,6 +348,7 @@ static inline void
+ _invoke_state_clear (PyGIInvokeState *state, PyGICallableCache *cache)
+ {
+     g_slice_free1 (cache->n_args * sizeof(GIArgument *), state->args);
++    g_slice_free1 (cache->n_args * sizeof(gpointer), state->args_data);
+     g_slice_free1 (cache->n_from_py_args * sizeof(GIArgument), state->in_args);
+     g_slice_free1 (cache->n_to_py_args * sizeof(GIArgument), state->out_args);
+     g_slice_free1 (cache->n_to_py_args * sizeof(GIArgument), state->out_values);
+diff --git a/gi/pygi-marshal-cleanup.c b/gi/pygi-marshal-cleanup.c
+index 503c61d..0246f31 100644
+--- a/gi/pygi-marshal-cleanup.c
++++ b/gi/pygi-marshal-cleanup.c
+@@ -221,6 +221,20 @@ _pygi_marshal_cleanup_to_py_interface_object (PyGIInvokeState *state,
+         g_object_unref (G_OBJECT(data));
+ }
+ 
++
++void
++_pygi_marshal_cleanup_from_py_interface_callback (PyGIInvokeState *state,
++                                                  PyGIArgCache    *arg_cache,
++                                                  gpointer         data,
++                                                  gboolean         was_processed)
++{
++    PyGICallbackCache *callback_cache = (PyGICallbackCache *)arg_cache;
++    if (was_processed && callback_cache->scope == GI_SCOPE_TYPE_CALL) {
++        _pygi_invoke_closure_free (state->args_data[arg_cache->c_arg_index]);
++        state->args_data[arg_cache->c_arg_index] = NULL;
++    }
++}
++
+ void 
+ _pygi_marshal_cleanup_from_py_interface_struct_gvalue (PyGIInvokeState *state,
+                                                        PyGIArgCache    *arg_cache,
+diff --git a/gi/pygi-marshal-cleanup.h b/gi/pygi-marshal-cleanup.h
+index 92027be..234e49c 100644
+--- a/gi/pygi-marshal-cleanup.h
++++ b/gi/pygi-marshal-cleanup.h
+@@ -68,6 +68,10 @@ void _pygi_marshal_cleanup_to_py_interface_object         (PyGIInvokeState *stat
+                                                            PyGIArgCache    *arg_cache,
+                                                            gpointer         data,
+                                                            gboolean         was_processed);
++void _pygi_marshal_cleanup_from_py_interface_callback     (PyGIInvokeState *state,
++                                                           PyGIArgCache    *arg_cache,
++                                                           gpointer         data,
++                                                           gboolean         was_processed);
+ void _pygi_marshal_cleanup_from_py_array                  (PyGIInvokeState *state,
+                                                            PyGIArgCache    *arg_cache,
+                                                            gpointer         data,
+diff --git a/gi/pygi-marshal-from-py.c b/gi/pygi-marshal-from-py.c
+index 45a9892..05a9b0c 100644
+--- a/gi/pygi-marshal-from-py.c
++++ b/gi/pygi-marshal-from-py.c
+@@ -1305,6 +1305,15 @@ _pygi_marshal_from_py_gerror (PyGIInvokeState   *state,
+     return FALSE;
+ }
+ 
++/* _pygi_destroy_notify_dummy:
++ *
++ * Dummy method used in the occasion when a method has a GDestroyNotify
++ * argument without user data.
++ */
++static void
++_pygi_destroy_notify_dummy (gpointer data) {
++}
++
+ gboolean
+ _pygi_marshal_from_py_interface_callback (PyGIInvokeState   *state,
+                                           PyGICallableCache *callable_cache,
+@@ -1324,17 +1333,14 @@ _pygi_marshal_from_py_interface_callback (PyGIInvokeState   *state,
+     if (callback_cache->user_data_index > 0) {
+         user_data_cache = callable_cache->args_cache[callback_cache->user_data_index];
+         if (user_data_cache->py_arg_index < state->n_py_in_args) {
++            /* py_user_data is a borrowed reference. */
+             py_user_data = PyTuple_GetItem (state->py_in_args, user_data_cache->py_arg_index);
+             if (!py_user_data)
+                 return FALSE;
+-        } else {
+-            py_user_data = Py_None;
+-            Py_INCREF (Py_None);
+         }
+     }
+ 
+     if (py_arg == Py_None && !(py_user_data == Py_None || py_user_data == NULL)) {
+-        Py_DECREF (py_user_data);
+         PyErr_Format (PyExc_TypeError,
+                       "When passing None for a callback userdata must also be None");
+ 
+@@ -1342,12 +1348,10 @@ _pygi_marshal_from_py_interface_callback (PyGIInvokeState   *state,
+     }
+ 
+     if (py_arg == Py_None) {
+-        Py_XDECREF (py_user_data);
+         return TRUE;
+     }
+ 
+     if (!PyCallable_Check (py_arg)) {
+-        Py_XDECREF (py_user_data);
+         PyErr_Format (PyExc_TypeError,
+                       "Callback needs to be a function or method not %s",
+                       py_arg->ob_type->tp_name);
+@@ -1355,22 +1359,53 @@ _pygi_marshal_from_py_interface_callback (PyGIInvokeState   *state,
+         return FALSE;
+     }
+ 
+-    if (callback_cache->destroy_notify_index > 0)
+-        destroy_cache = callable_cache->args_cache[callback_cache->destroy_notify_index];
+-
+     callable_info = (GICallableInfo *)callback_cache->interface_info;
+ 
+     closure = _pygi_make_native_closure (callable_info, callback_cache->scope, py_arg, py_user_data);
+     arg->v_pointer = closure->closure;
++
++    /* The PyGICClosure instance is used as user data passed into the C function.
++     * The return trip to python will marshal this back and pull the python user data out.
++     */
+     if (user_data_cache != NULL) {
+         state->in_args[user_data_cache->c_arg_index].v_pointer = closure;
+     }
+ 
++    /* Setup a GDestroyNotify callback if this method supports it along with
++     * a user data field. The user data field is a requirement in order
++     * free resources and ref counts associated with this arguments closure.
++     * In case a user data field is not available, show a warning giving
++     * explicit information and setup a dummy notification to avoid a crash
++     * later on in _pygi_destroy_notify_callback_closure.
++     */
++    if (callback_cache->destroy_notify_index > 0) {
++        destroy_cache = callable_cache->args_cache[callback_cache->destroy_notify_index];
++    }
++
+     if (destroy_cache) {
+-        PyGICClosure *destroy_notify = _pygi_destroy_notify_create ();
+-        state->in_args[destroy_cache->c_arg_index].v_pointer = destroy_notify->closure;
++        if (user_data_cache != NULL) {
++            PyGICClosure *destroy_notify = _pygi_destroy_notify_create ();
++            state->in_args[destroy_cache->c_arg_index].v_pointer = destroy_notify->closure;
++        } else {
++            gchar *msg = g_strdup_printf("Callables passed to %s will leak references because "
++                                         "the method does not support a user_data argument. "
++                                         "See: https://bugzilla.gnome.org/show_bug.cgi?id=685598",
++                                         callable_cache->name);
++            if (PyErr_WarnEx(PyExc_RuntimeWarning, msg, 2)) {
++                g_free(msg);
++                _pygi_invoke_closure_free(closure);
++                return FALSE;
++            }
++            g_free(msg);
++            state->in_args[destroy_cache->c_arg_index].v_pointer = _pygi_destroy_notify_dummy;
++        }
+     }
+ 
++    /* Store the PyGIClosure as extra args data so _pygi_marshal_cleanup_from_py_interface_callback
++     * can clean it up later for GI_SCOPE_TYPE_CALL based closures.
++     */
++    state->args_data[arg_cache->c_arg_index] = closure;
++
+     return TRUE;
+ }
+ 
+diff --git a/tests/test_everything.py b/tests/test_everything.py
+index b45f444..4fddf65 100644
+--- a/tests/test_everything.py
++++ b/tests/test_everything.py
+@@ -4,6 +4,9 @@
+ 
+ import unittest
+ import traceback
++import warnings
++import gc
++gc
+ 
+ import sys
+ from sys import getrefcount
+@@ -337,27 +340,46 @@ class TestCallbacks(unittest.TestCase):
+         self.assertEqual(Everything.test_callback(callback), 44)
+         self.assertTrue(TestCallbacks.called)
+ 
+-    def test_callback_async(self):
++    def test_callback_scope_async(self):
+         TestCallbacks.called = False
++        ud = 'Test Value 44'
+ 
+-        def callback(foo):
++        def callback(user_data):
++            self.assertEqual(user_data, ud)
+             TestCallbacks.called = True
+-            return foo
++            return 44
++
++        ud_refcount = sys.getrefcount(ud)
++        callback_refcount = sys.getrefcount(callback)
+ 
+-        Everything.test_callback_async(callback, 44)
+-        i = Everything.test_callback_thaw_async()
+-        self.assertEqual(44, i)
++        self.assertEqual(Everything.test_callback_async(callback, ud), None)
++        # Callback should not have run and the ref count is increased by 1
++        self.assertEqual(TestCallbacks.called, False)
++        self.assertEqual(sys.getrefcount(callback), callback_refcount + 1)
++        self.assertEqual(sys.getrefcount(ud), ud_refcount + 1)
++
++        # test_callback_thaw_async will run the callback previously supplied.
++        # references should be auto decremented after this call.
++        self.assertEqual(Everything.test_callback_thaw_async(), 44)
+         self.assertTrue(TestCallbacks.called)
+ 
+-    def test_callback_scope_call(self):
++        # Make sure refcounts are returned to normal
++        self.assertEqual(sys.getrefcount(callback), callback_refcount)
++        self.assertEqual(sys.getrefcount(ud), ud_refcount)
++
++    def test_callback_scope_call_multi(self):
++        # This tests a callback that gets called multiple times from a
++        # single scope call in python.
+         TestCallbacks.called = 0
+ 
+         def callback():
+             TestCallbacks.called += 1
+             return 0
+ 
++        refcount = sys.getrefcount(callback)
+         Everything.test_multi_callback(callback)
+         self.assertEqual(TestCallbacks.called, 2)
++        self.assertEqual(sys.getrefcount(callback), refcount)
+ 
+     def test_callback_userdata(self):
+         TestCallbacks.called = 0
+@@ -373,24 +395,6 @@ class TestCallbacks(unittest.TestCase):
+ 
+         self.assertEqual(TestCallbacks.called, 100)
+ 
+-    def test_callback_userdata_refcount(self):
+-        TestCallbacks.called = False
+-
+-        def callback(userdata):
+-            TestCallbacks.called = True
+-            return 1
+-
+-        ud = "Test User Data"
+-
+-        start_ref_count = getrefcount(ud)
+-        for i in range(100):
+-            Everything.test_callback_destroy_notify(callback, ud)
+-
+-        Everything.test_callback_thaw_notifications()
+-        end_ref_count = getrefcount(ud)
+-
+-        self.assertEqual(start_ref_count, end_ref_count)
+-
+     def test_async_ready_callback(self):
+         TestCallbacks.called = False
+         TestCallbacks.main_loop = GObject.MainLoop()
+@@ -405,15 +409,73 @@ class TestCallbacks(unittest.TestCase):
+ 
+         self.assertTrue(TestCallbacks.called)
+ 
+-    def test_callback_destroy_notify(self):
++    def test_callback_scope_notified_with_destroy(self):
++        TestCallbacks.called = 0
++        ud = 'Test scope notified data 33'
++
+         def callback(user_data):
+-            TestCallbacks.called = True
+-            return 42
++            self.assertEqual(user_data, ud)
++            TestCallbacks.called += 1
++            return 33
+ 
+-        TestCallbacks.called = False
+-        self.assertEqual(Everything.test_callback_destroy_notify(callback, 42), 42)
+-        self.assertTrue(TestCallbacks.called)
+-        self.assertEqual(Everything.test_callback_thaw_notifications(), 42)
++        value_refcount = sys.getrefcount(ud)
++        callback_refcount = sys.getrefcount(callback)
++
++        # Callback is immediately called.
++        for i in range(100):
++            res = Everything.test_callback_destroy_notify(callback, ud)
++            self.assertEqual(res, 33)
++
++        self.assertEqual(TestCallbacks.called, 100)
++        self.assertEqual(sys.getrefcount(callback), callback_refcount + 100)
++        self.assertEqual(sys.getrefcount(ud), value_refcount + 100)
++
++        # thaw will call the callback again, this time resources should be freed
++        self.assertEqual(Everything.test_callback_thaw_notifications(), 33 * 100)
++        self.assertEqual(TestCallbacks.called, 200)
++        self.assertEqual(sys.getrefcount(callback), callback_refcount)
++        self.assertEqual(sys.getrefcount(ud), value_refcount)
++
++    def test_callback_scope_notified_with_destroy_no_user_data(self):
++        TestCallbacks.called = 0
++
++        def callback(user_data):
++            self.assertEqual(user_data, None)
++            TestCallbacks.called += 1
++            return 34
++
++        callback_refcount = sys.getrefcount(callback)
++
++        # Run with warning as exception
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("error")
++            self.assertRaises(RuntimeWarning,
++                              Everything.test_callback_destroy_notify_no_user_data,
++                              callback)
++
++        self.assertEqual(TestCallbacks.called, 0)
++        self.assertEqual(sys.getrefcount(callback), callback_refcount)
++
++        # Run with warning as warning
++        with warnings.catch_warnings(record=True) as w:
++            # Cause all warnings to always be triggered.
++            warnings.simplefilter("default")
++            # Trigger a warning.
++            res = Everything.test_callback_destroy_notify_no_user_data(callback)
++            # Verify some things
++            self.assertEqual(len(w), 1)
++            self.assertTrue(issubclass(w[-1].category, RuntimeWarning))
++            self.assertTrue('Callables passed to' in str(w[-1].message))
++
++        self.assertEqual(res, 34)
++        self.assertEqual(TestCallbacks.called, 1)
++        self.assertEqual(sys.getrefcount(callback), callback_refcount + 1)
++
++        # thaw will call the callback again,
++        # refcount will not go down without user_data parameter
++        self.assertEqual(Everything.test_callback_thaw_notifications(), 34)
++        self.assertEqual(TestCallbacks.called, 2)
++        self.assertEqual(sys.getrefcount(callback), callback_refcount + 1)
+ 
+     def test_callback_in_methods(self):
+         object_ = Everything.TestObj()
+@@ -431,12 +493,17 @@ class TestCallbacks(unittest.TestCase):
+         self.assertTrue(TestCallbacks.called)
+ 
+         def callbackWithUserData(user_data):
+-            TestCallbacks.called = True
++            TestCallbacks.called += 1
+             return 42
+ 
+-        TestCallbacks.called = False
++        TestCallbacks.called = 0
+         Everything.TestObj.new_callback(callbackWithUserData, None)
+-        self.assertTrue(TestCallbacks.called)
++        self.assertEqual(TestCallbacks.called, 1)
++        # Note: using "new_callback" adds the notification to the same global
++        # list as Everything.test_callback_destroy_notify, so thaw the list
++        # so we don't get confusion between tests.
++        self.assertEqual(Everything.test_callback_thaw_notifications(), 42)
++        self.assertEqual(TestCallbacks.called, 2)
+ 
+     def test_callback_none(self):
+         # make sure this doesn't assert or crash
+-- 
+1.7.9.5
+

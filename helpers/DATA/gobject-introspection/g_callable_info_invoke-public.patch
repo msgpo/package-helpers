@@ -1,0 +1,150 @@
+From 52c3b6b86129907dfb72a3dc394117470791845b Mon Sep 17 00:00:00 2001
+From: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Date: Sun, 30 Oct 2011 16:31:23 +0100
+Subject: [PATCH] Make g_callable_info_invoke public
+
+So it can be used for invoking callbacks
+
+https://bugzilla.gnome.org/show_bug.cgi?id=663052
+---
+ girepository/gicallableinfo.c       |   20 ++++++++++----------
+ girepository/gicallableinfo.h       |   10 ++++++++++
+ girepository/gifunctioninfo.c       |   20 ++++++++++----------
+ girepository/girepository-private.h |   11 -----------
+ girepository/givfuncinfo.c          |   20 ++++++++++----------
+ 5 files changed, 40 insertions(+), 41 deletions(-)
+
+diff --git a/girepository/gicallableinfo.c b/girepository/gicallableinfo.c
+index 475346e..ba5f6c6 100644
+--- a/girepository/gicallableinfo.c
++++ b/girepository/gicallableinfo.c
+@@ -360,16 +360,16 @@ g_callable_info_iterate_return_attributes (GICallableInfo  *info,
+ }
+ 
+ gboolean
+-_g_callable_info_invoke (GIFunctionInfo *info,
+-                         gpointer          function,
+-                         const GIArgument  *in_args,
+-                         int               n_in_args,
+-                         const GIArgument  *out_args,
+-                         int               n_out_args,
+-                         GIArgument        *return_value,
+-                         gboolean          is_method,
+-                         gboolean          throws,
+-                         GError          **error)
++g_callable_info_invoke (GIFunctionInfo *info,
++                        gpointer          function,
++                        const GIArgument  *in_args,
++                        int               n_in_args,
++                        const GIArgument  *out_args,
++                        int               n_out_args,
++                        GIArgument        *return_value,
++                        gboolean          is_method,
++                        gboolean          throws,
++                        GError          **error)
+ {
+   ffi_cif cif;
+   ffi_type *rtype;
+diff --git a/girepository/gicallableinfo.h b/girepository/gicallableinfo.h
+index a1d22c7..bdaa96d 100644
+--- a/girepository/gicallableinfo.h
++++ b/girepository/gicallableinfo.h
+@@ -54,6 +54,16 @@ GIArgInfo *            g_callable_info_get_arg         (GICallableInfo *info,
+ void                   g_callable_info_load_arg        (GICallableInfo *info,
+                                                         gint            n,
+                                                         GIArgInfo      *arg);
++gboolean               g_callable_info_invoke          (GICallableInfo   *info,
++                                                        gpointer          function,
++                                                        const GIArgument *in_args,
++                                                        int               n_in_args,
++                                                        const GIArgument *out_args,
++                                                        int               n_out_args,
++                                                        GIArgument       *return_value,
++                                                        gboolean          is_method,
++                                                        gboolean          throws,
++                                                        GError          **error);
+ G_END_DECLS
+ 
+ 
+diff --git a/girepository/gifunctioninfo.c b/girepository/gifunctioninfo.c
+index 2544cc3..2cf6ddb 100644
+--- a/girepository/gifunctioninfo.c
++++ b/girepository/gifunctioninfo.c
+@@ -270,14 +270,14 @@ g_function_info_invoke (GIFunctionInfo *info,
+     && (g_function_info_get_flags (info) & GI_FUNCTION_IS_CONSTRUCTOR) == 0;
+   throws = g_function_info_get_flags (info) & GI_FUNCTION_THROWS;
+ 
+-  return _g_callable_info_invoke ((GICallableInfo*) info,
+-                                  func,
+-                                  in_args,
+-                                  n_in_args,
+-                                  out_args,
+-                                  n_out_args,
+-                                  return_value,
+-                                  is_method,
+-                                  throws,
+-                                  error);
++  return g_callable_info_invoke ((GICallableInfo*) info,
++                                 func,
++                                 in_args,
++                                 n_in_args,
++                                 out_args,
++                                 n_out_args,
++                                 return_value,
++                                 is_method,
++                                 throws,
++                                 error);
+ }
+diff --git a/girepository/girepository-private.h b/girepository/girepository-private.h
+index 52d65b2..897c52c 100644
+--- a/girepository/girepository-private.h
++++ b/girepository/girepository-private.h
+@@ -108,17 +108,6 @@ GIVFuncInfo * _g_base_info_find_vfunc (GIRealInfo   *rinfo,
+ 				       gint          n_vfuncs,
+ 				       const gchar  *name);
+ 
+-gboolean _g_callable_info_invoke (GICallableInfo   *info,
+-                                  gpointer          function,
+-                                  const GIArgument *in_args,
+-                                  int               n_in_args,
+-                                  const GIArgument *out_args,
+-                                  int               n_out_args,
+-                                  GIArgument       *return_value,
+-                                  gboolean          is_method,
+-                                  gboolean          throws,
+-                                  GError          **error);
+-
+ extern ffi_status ffi_prep_closure_loc (ffi_closure *,
+                                         ffi_cif *,
+                                         void (*fun)(ffi_cif *, void *, void **, void *),
+diff --git a/girepository/givfuncinfo.c b/girepository/givfuncinfo.c
+index 332655a..859f5d5 100644
+--- a/girepository/givfuncinfo.c
++++ b/girepository/givfuncinfo.c
+@@ -304,14 +304,14 @@ g_vfunc_info_invoke (GIVFuncInfo      *info,
+   if (*error != NULL)
+     return FALSE;
+ 
+-  return _g_callable_info_invoke ((GICallableInfo*) info,
+-                                  func,
+-                                  in_args,
+-                                  n_in_args,
+-                                  out_args,
+-                                  n_out_args,
+-                                  return_value,
+-                                  TRUE,
+-                                  FALSE,
+-                                  error);
++  return g_callable_info_invoke ((GICallableInfo*) info,
++                                 func,
++                                 in_args,
++                                 n_in_args,
++                                 out_args,
++                                 n_out_args,
++                                 return_value,
++                                 TRUE,
++                                 FALSE,
++                                 error);
+ }
+-- 
+1.7.6.4
